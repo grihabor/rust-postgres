@@ -4,16 +4,22 @@ use crate::types::{FromSql, IsNull, ToSql, Type, WrongType};
 use crate::{slice_iter, CopyInSink, CopyOutStream, Error};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures_util::{ready, SinkExt, Stream};
+use futures_util::{ready, SinkExt, Stream, stream_select};
 use pin_project_lite::pin_project;
-use postgres_types::BorrowToSql;
+use postgres_types::{BorrowToSql, Field};
 use std::convert::TryFrom;
-use std::io;
+use tokio::io;
 use std::io::Cursor;
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::pin::Pin;
+use std::future::Future;
+use std::mem;
+use std::slice::SliceIndex;
+use fallible_iterator::FallibleIterator;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use std::marker::PhantomData;
 
 const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
 const HEADER_LEN: usize = MAGIC.len() + 4 + 4;
@@ -60,10 +66,10 @@ impl BinaryCopyInWriter {
     ///
     /// Panics if the number of values provided does not match the number expected.
     pub async fn write_raw<P, I>(self: Pin<&mut Self>, values: I) -> Result<(), Error>
-    where
-        P: BorrowToSql,
-        I: IntoIterator<Item = P>,
-        I::IntoIter: ExactSizeIterator,
+        where
+            P: BorrowToSql,
+            I: IntoIterator<Item=P>,
+            I::IntoIter: ExactSizeIterator,
     {
         let mut this = self.project();
 
@@ -111,130 +117,178 @@ impl BinaryCopyInWriter {
     }
 }
 
+pub struct StreamReader<S: Stream<Item=Bytes>> {
+    stream: S,
+}
+
+impl<S: Stream<Item=Bytes>> StreamReader<S> {
+    fn new(stream: S) -> Self {
+        StreamReader {
+            stream
+        }
+    }
+}
+
+impl<S: Stream<Item=Bytes>> AsyncRead for StreamReader<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        todo!()
+    }
+}
+
 struct Header {
     has_oids: bool,
+}
+
+pin_project! {
+    struct BinaryCopyOutContext<R: AsyncReadExt> {
+        #[pin]
+        reader: R,
+        types: Arc<Vec<Type>>,
+        header: Option<Header>,
+    }
 }
 
 pin_project! {
     /// A stream of rows deserialized from the PostgreSQL binary copy format.
     pub struct BinaryCopyOutStream {
         #[pin]
-        stream: CopyOutStream,
-        types: Arc<Vec<Type>>,
-        header: Option<Header>,
+        future: Pin<Box<dyn Future<Output = Option<Result<BinaryCopyOutRow, Error>>>>>,
     }
 }
 
 impl BinaryCopyOutStream {
     /// Creates a stream from a raw copy out stream and the types of the columns being returned.
-    pub fn new(stream: CopyOutStream, types: &[Type]) -> BinaryCopyOutStream {
-        BinaryCopyOutStream {
-            stream,
+    pub fn new<R: AsyncReadExt + Unpin>(reader: R, types: &[Type]) -> BinaryCopyOutStream {
+        let ctx = Box::pin(BinaryCopyOutContext {
+            reader,
             types: Arc::new(types.to_vec()),
             header: None,
+        });
+        BinaryCopyOutStream {
+           future: Box::pin(ctx.as_mut().poll_next_option()),
         }
     }
 }
 
-impl Stream for BinaryCopyOutStream {
-    type Item = Result<BinaryCopyOutRow, Error>;
+impl<R: AsyncReadExt + Unpin> BinaryCopyOutContext<R> {
+    async fn poll_next_option(self: Pin<&mut Self>) -> Option<Result<BinaryCopyOutRow, Error>> {
+        Some(self.poll_next().await.map_err(Error::parse))
+    }
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-
-        let chunk = match ready!(this.stream.poll_next(cx)) {
-            Some(Ok(chunk)) => chunk,
-            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-            None => return Poll::Ready(Some(Err(Error::closed()))),
-        };
-        let mut chunk = Cursor::new(chunk);
+    async fn poll_next(self: Pin<&mut Self>) -> Result<BinaryCopyOutRow, io::Error> {
+        let mut this = self.project();
 
         let has_oids = match &this.header {
             Some(header) => header.has_oids,
             None => {
-                check_remaining(&chunk, HEADER_LEN)?;
-                if !chunk.chunk().starts_with(MAGIC) {
-                    return Poll::Ready(Some(Err(Error::parse(io::Error::new(
+                let mut magic: &mut [u8] = &mut [0; MAGIC.len()];
+                this.reader.read_exact(&mut magic).await?;
+                if magic != MAGIC {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid magic value",
-                    )))));
+                    ));
                 }
-                chunk.advance(MAGIC.len());
 
-                let flags = chunk.get_i32();
+                let flags = this.reader.read_u32().await?;
                 let has_oids = (flags & (1 << 16)) != 0;
 
-                let header_extension = chunk.get_u32() as usize;
-                check_remaining(&chunk, header_extension)?;
-                chunk.advance(header_extension);
+                let header_extension_size = this.reader.read_u32().await?;
+                // skip header extension
+                let mut header_extension: Box<[u8]> = vec![0; header_extension_size as usize].into_boxed_slice();
+                this.reader.read_exact(&mut header_extension).await?;
 
                 *this.header = Some(Header { has_oids });
                 has_oids
             }
         };
 
-        check_remaining(&chunk, 2)?;
-        let mut len = chunk.get_i16();
-        if len == -1 {
-            return Poll::Ready(None);
-        }
+        let mut field_count = this.reader.read_u16().await?;
 
         if has_oids {
-            len += 1;
+            field_count += 1;
         }
-        if len as usize != this.types.len() {
-            return Poll::Ready(Some(Err(Error::parse(io::Error::new(
+        if field_count as usize != this.types.len() {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("expected {} values but got {}", this.types.len(), len),
-            )))));
+                format!("expected {} values but got {}", this.types.len(), field_count),
+            ));
         }
 
-        let mut ranges = vec![];
-        for _ in 0..len {
-            check_remaining(&chunk, 4)?;
-            let len = chunk.get_i32();
-            if len == -1 {
-                ranges.push(None);
-            } else {
-                let len = len as usize;
-                check_remaining(&chunk, len)?;
-                let start = chunk.position() as usize;
-                ranges.push(Some(start..start + len));
-                chunk.advance(len);
+        let mut buf = BytesMut::new();
+        let mut field_indices = vec![];
+        for _ in 0..field_count {
+            let field_size = this.reader.read_u32().await?;
+            let start = buf.len();
+            if field_size == u32::MAX {
+                field_indices.push(FieldIndex::Null(start));
+                continue;
             }
+            let field_size = field_size as usize;
+            buf.resize(start + field_size, 0);
+            this.reader.read_exact(&mut buf[start..start + field_size]);
+            field_indices.push(FieldIndex::Value(start));
         }
 
-        Poll::Ready(Some(Ok(BinaryCopyOutRow {
-            buf: chunk.into_inner(),
-            ranges,
+        Ok(BinaryCopyOutRow {
+            fields: Fields {
+                buf,
+                indices: field_indices,
+            },
             types: this.types.clone(),
-        })))
+        })
     }
 }
 
-fn check_remaining(buf: &Cursor<Bytes>, len: usize) -> Result<(), Error> {
-    if buf.remaining() < len {
-        Err(Error::parse(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected EOF",
-        )))
-    } else {
-        Ok(())
+impl<'a> Stream for BinaryCopyOutStream {
+    type Item = Result<BinaryCopyOutRow, Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.future.as_mut().poll(cx)
+    }
+}
+
+enum FieldIndex {
+    Value(usize),
+    Null(usize),
+}
+
+impl FieldIndex {
+    fn index(&self) -> usize {
+        match self {
+            FieldIndex::Value(index) => *index,
+            FieldIndex::Null(index) => *index,
+        }
+    }
+}
+
+struct Fields {
+    buf: BytesMut,
+    indices: Vec<FieldIndex>,
+}
+
+impl Fields {
+    fn field(&self, idx: usize) -> &[u8] {
+        if idx + 1 < self.indices.len() {
+            &self.buf[self.indices[idx].index()..self.indices[idx + 1].index()]
+        } else {
+            &self.buf[self.indices[idx].index()..]
+        }
     }
 }
 
 /// A row of data parsed from a binary copy out stream.
 pub struct BinaryCopyOutRow {
-    buf: Bytes,
-    ranges: Vec<Option<Range<usize>>>,
+    fields: Fields,
     types: Arc<Vec<Type>>,
 }
 
 impl BinaryCopyOutRow {
     /// Like `get`, but returns a `Result` rather than panicking.
     pub fn try_get<'a, T>(&'a self, idx: usize) -> Result<T, Error>
-    where
-        T: FromSql<'a>,
+        where
+            T: FromSql<'a>,
     {
         let type_ = match self.types.get(idx) {
             Some(type_) => type_,
@@ -248,9 +302,9 @@ impl BinaryCopyOutRow {
             ));
         }
 
-        let r = match &self.ranges[idx] {
-            Some(range) => T::from_sql(type_, &self.buf[range.clone()]),
-            None => T::from_sql_null(type_),
+        let r = match &self.fields.indices[idx] {
+            FieldIndex::Value(_) => T::from_sql(type_, self.fields.field(idx)),
+            FieldIndex::Null(_) => T::from_sql_null(type_),
         };
 
         r.map_err(|e| Error::from_sql(e, idx))
@@ -262,8 +316,8 @@ impl BinaryCopyOutRow {
     ///
     /// Panics if the index is out of bounds or if the value cannot be converted to the specified type.
     pub fn get<'a, T>(&'a self, idx: usize) -> T
-    where
-        T: FromSql<'a>,
+        where
+            T: FromSql<'a>,
     {
         match self.try_get(idx) {
             Ok(value) => value,

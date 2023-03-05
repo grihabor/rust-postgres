@@ -1,39 +1,43 @@
 //! Utilities for working with the PostgreSQL binary copy format.
 
-use crate::types::{FromSql, IsNull, ToSql, Type, WrongType};
-use crate::{slice_iter, CopyInSink, CopyOutStream, Error};
-use byteorder::{BigEndian, ByteOrder};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures_util::{ready, SinkExt, Stream, stream_select};
-use pin_project_lite::pin_project;
-use postgres_types::{BorrowToSql, Field};
+use core::result;
+use futures_util::future::{BoxFuture, LocalBoxFuture};
 use std::convert::TryFrom;
-use tokio::io;
+use std::fmt::Binary;
+use std::future::Future;
 use std::io::Cursor;
+use std::marker::PhantomData;
+use std::mem;
 use std::ops::{Bound, Range};
 use std::pin::Pin;
-use std::future::Future;
-use std::mem;
 use std::slice::SliceIndex;
-use fallible_iterator::FallibleIterator;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+use byteorder::{BigEndian, ByteOrder};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use fallible_iterator::FallibleIterator;
+use futures_util::{ready, stream_select, FutureExt, SinkExt, Stream};
+use pin_project::pin_project;
+use postgres_types::{BorrowToSql, Field};
+use tokio::io;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
-use std::marker::PhantomData;
+
+use crate::types::{FromSql, IsNull, ToSql, Type, WrongType};
+use crate::{slice_iter, CopyInSink, CopyOutStream, Error};
 
 const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
 const HEADER_LEN: usize = MAGIC.len() + 4 + 4;
 
-pin_project! {
-    /// A type which serializes rows into the PostgreSQL binary copy format.
-    ///
-    /// The copy *must* be explicitly completed via the `finish` method. If it is not, the copy will be aborted.
-    pub struct BinaryCopyInWriter {
-        #[pin]
-        sink: CopyInSink<Bytes>,
-        types: Vec<Type>,
-        buf: BytesMut,
-    }
+/// A type which serializes rows into the PostgreSQL binary copy format.
+///
+/// The copy *must* be explicitly completed via the `finish` method. If it is not, the copy will be aborted.
+#[pin_project]
+pub struct BinaryCopyInWriter {
+    #[pin]
+    sink: CopyInSink<Bytes>,
+    types: Vec<Type>,
+    buf: BytesMut,
 }
 
 impl BinaryCopyInWriter {
@@ -56,7 +60,7 @@ impl BinaryCopyInWriter {
     /// # Panics
     ///
     /// Panics if the number of values provided does not match the number expected.
-    pub async fn write(self: Pin<&mut Self>, values: &[&(dyn ToSql + Sync)]) -> Result<(), Error> {
+    pub async fn write(self: Pin<&mut Self>, values: &[&(dyn ToSql + Sync)]) -> Result<()> {
         self.write_raw(slice_iter(values)).await
     }
 
@@ -65,11 +69,11 @@ impl BinaryCopyInWriter {
     /// # Panics
     ///
     /// Panics if the number of values provided does not match the number expected.
-    pub async fn write_raw<P, I>(self: Pin<&mut Self>, values: I) -> Result<(), Error>
-        where
-            P: BorrowToSql,
-            I: IntoIterator<Item=P>,
-            I::IntoIter: ExactSizeIterator,
+    pub async fn write_raw<P, I>(self: Pin<&mut Self>, values: I) -> Result<()>
+    where
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
     {
         let mut this = self.project();
 
@@ -108,7 +112,7 @@ impl BinaryCopyInWriter {
     /// Completes the copy, returning the number of rows added.
     ///
     /// This method *must* be used to complete the copy process. If it is not, the copy will be aborted.
-    pub async fn finish(self: Pin<&mut Self>) -> Result<u64, Error> {
+    pub async fn finish(self: Pin<&mut Self>) -> Result<u64> {
         let mut this = self.project();
 
         this.buf.put_i16(-1);
@@ -117,20 +121,22 @@ impl BinaryCopyInWriter {
     }
 }
 
-pub struct StreamReader<S: Stream<Item=Bytes>> {
+pub struct StreamReader<S: Stream<Item = Bytes>> {
     stream: S,
 }
 
-impl<S: Stream<Item=Bytes>> StreamReader<S> {
+impl<S: Stream<Item = Bytes>> StreamReader<S> {
     fn new(stream: S) -> Self {
-        StreamReader {
-            stream
-        }
+        StreamReader { stream }
     }
 }
 
-impl<S: Stream<Item=Bytes>> AsyncRead for StreamReader<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+impl<S: Stream<Item = Bytes>> AsyncRead for StreamReader<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         todo!()
     }
 }
@@ -139,43 +145,76 @@ struct Header {
     has_oids: bool,
 }
 
-pin_project! {
-    struct BinaryCopyOutContext<R: AsyncReadExt> {
-        #[pin]
-        reader: R,
-        types: Arc<Vec<Type>>,
-        header: Option<Header>,
-    }
+type Result<T> = result::Result<T, Error>;
+
+#[pin_project]
+struct BinaryCopyOutStream<'r, R>
+where
+    R: AsyncReadExt + 'r,
+{
+    #[pin]
+    reader: R,
+    types: Arc<Vec<Type>>,
+    header: Option<Header>,
+    future: Option<LocalBoxFuture<'r, Option<Result<BinaryCopyOutRow>>>>,
 }
 
-pin_project! {
-    /// A stream of rows deserialized from the PostgreSQL binary copy format.
-    pub struct BinaryCopyOutStream {
-        #[pin]
-        future: Pin<Box<dyn Future<Output = Option<Result<BinaryCopyOutRow, Error>>>>>,
-    }
+#[pin_project(project = OptProj, project_replace = OptProjOwn)]
+enum Opt<T> {
+    Some(#[pin] T),
+    None,
 }
 
-impl BinaryCopyOutStream {
-    /// Creates a stream from a raw copy out stream and the types of the columns being returned.
-    pub fn new<R: AsyncReadExt + Unpin>(reader: R, types: &[Type]) -> BinaryCopyOutStream {
-        let ctx = Box::pin(BinaryCopyOutContext {
-            reader,
-            types: Arc::new(types.to_vec()),
-            header: None,
-        });
-        BinaryCopyOutStream {
-           future: Box::pin(ctx.as_mut().poll_next_option()),
+impl<T> Opt<T> {
+    fn unwrap(self) -> T {
+        match self {
+            Opt::Some(t) => t,
+            Opt::None => panic!("value is None"),
         }
     }
 }
 
-impl<R: AsyncReadExt + Unpin> BinaryCopyOutContext<R> {
-    async fn poll_next_option(self: Pin<&mut Self>) -> Option<Result<BinaryCopyOutRow, Error>> {
-        Some(self.poll_next().await.map_err(Error::parse))
+impl<'r, R> BinaryCopyOutStream<'r, R>
+where
+    R: AsyncReadExt + 'r,
+{
+    /// Creates a stream from a raw copy out stream and the types of the columns being returned.
+    pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<'r, R> {
+        BinaryCopyOutStream {
+            reader,
+            types: Arc::new(types.to_vec()),
+            header: None,
+            future: None,
+        }
+    }
+}
+
+impl<'r, R> Stream for BinaryCopyOutStream<'r, R>
+where
+    R: AsyncReadExt + 'r,
+{
+    type Item = Result<BinaryCopyOutRow>;
+
+    fn poll_next<'a>(self: Pin<&'a mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = &mut self.project();
+
+        if let None = *this.future {
+            *this.future = Some(self._poll_next().boxed_local());
+        }
+
+        this.future.unwrap().as_mut().poll(cx)
+    }
+}
+
+impl<'r, R> BinaryCopyOutStream<'r, R>
+where
+    R: AsyncReadExt + 'r,
+{
+    async fn _poll_next(self: Pin<&mut Self>) -> Option<Result<BinaryCopyOutRow>> {
+        Some(self._poll_next_result().await.map_err(Error::parse))
     }
 
-    async fn poll_next(self: Pin<&mut Self>) -> Result<BinaryCopyOutRow, io::Error> {
+    async fn _poll_next_result(self: Pin<&mut Self>) -> io::Result<BinaryCopyOutRow> {
         let mut this = self.project();
 
         let has_oids = match &this.header {
@@ -195,7 +234,8 @@ impl<R: AsyncReadExt + Unpin> BinaryCopyOutContext<R> {
 
                 let header_extension_size = this.reader.read_u32().await?;
                 // skip header extension
-                let mut header_extension: Box<[u8]> = vec![0; header_extension_size as usize].into_boxed_slice();
+                let mut header_extension: Box<[u8]> =
+                    vec![0; header_extension_size as usize].into_boxed_slice();
                 this.reader.read_exact(&mut header_extension).await?;
 
                 *this.header = Some(Header { has_oids });
@@ -211,7 +251,11 @@ impl<R: AsyncReadExt + Unpin> BinaryCopyOutContext<R> {
         if field_count as usize != this.types.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("expected {} values but got {}", this.types.len(), field_count),
+                format!(
+                    "expected {} values but got {}",
+                    this.types.len(),
+                    field_count
+                ),
             ));
         }
 
@@ -237,15 +281,6 @@ impl<R: AsyncReadExt + Unpin> BinaryCopyOutContext<R> {
             },
             types: this.types.clone(),
         })
-    }
-}
-
-impl<'a> Stream for BinaryCopyOutStream {
-    type Item = Result<BinaryCopyOutRow, Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        this.future.as_mut().poll(cx)
     }
 }
 
@@ -286,9 +321,9 @@ pub struct BinaryCopyOutRow {
 
 impl BinaryCopyOutRow {
     /// Like `get`, but returns a `Result` rather than panicking.
-    pub fn try_get<'a, T>(&'a self, idx: usize) -> Result<T, Error>
-        where
-            T: FromSql<'a>,
+    pub fn try_get<'a, T>(&'a self, idx: usize) -> Result<T>
+    where
+        T: FromSql<'a>,
     {
         let type_ = match self.types.get(idx) {
             Some(type_) => type_,
@@ -316,8 +351,8 @@ impl BinaryCopyOutRow {
     ///
     /// Panics if the index is out of bounds or if the value cannot be converted to the specified type.
     pub fn get<'a, T>(&'a self, idx: usize) -> T
-        where
-            T: FromSql<'a>,
+    where
+        T: FromSql<'a>,
     {
         match self.try_get(idx) {
             Ok(value) => value,

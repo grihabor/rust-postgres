@@ -2,6 +2,8 @@
 
 use core::result;
 use futures_util::future::{BoxFuture, LocalBoxFuture};
+use std::borrow::BorrowMut;
+use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryFrom;
 use std::fmt::Binary;
 use std::future::Future;
@@ -9,9 +11,12 @@ use std::io::Cursor;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Bound, Range};
+use std::os::linux::raw::pthread_t;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::slice::SliceIndex;
 use std::sync::Arc;
+use std::task::Poll::Pending;
 use std::task::{Context, Poll};
 
 use byteorder::{BigEndian, ByteOrder};
@@ -141,147 +146,151 @@ impl<S: Stream<Item = Bytes>> AsyncRead for StreamReader<S> {
     }
 }
 
+#[derive(Copy, Clone)]
 struct Header {
     has_oids: bool,
 }
 
 type Result<T> = result::Result<T, Error>;
 
-#[pin_project]
-struct BinaryCopyOutStream<'r, R>
+pub struct BinaryCopyOutStream<'f, 'r, R>
 where
-    R: AsyncReadExt + 'r,
+    R: AsyncReadExt + Unpin + 'r,
+    'r: 'f,
 {
-    #[pin]
-    reader: R,
-    types: Arc<Vec<Type>>,
-    header: Option<Header>,
-    future: Option<LocalBoxFuture<'r, Option<Result<BinaryCopyOutRow>>>>,
+    _r: PhantomData<&'r ()>,
+    reader: Rc<RefCell<R>>,
+    types: Rc<Vec<Type>>,
+    header: Rc<RefCell<Option<Header>>>,
+    future: Option<LocalBoxFuture<'f, Result<BinaryCopyOutRow>>>,
 }
 
-#[pin_project(project = OptProj, project_replace = OptProjOwn)]
-enum Opt<T> {
-    Some(#[pin] T),
-    None,
-}
-
-impl<T> Opt<T> {
-    fn unwrap(self) -> T {
-        match self {
-            Opt::Some(t) => t,
-            Opt::None => panic!("value is None"),
-        }
-    }
-}
-
-impl<'r, R> BinaryCopyOutStream<'r, R>
+impl<'f, 'r, R> BinaryCopyOutStream<'f, 'r, R>
 where
-    R: AsyncReadExt + 'r,
+    R: AsyncReadExt + Unpin + 'r,
 {
     /// Creates a stream from a raw copy out stream and the types of the columns being returned.
-    pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<'r, R> {
+    pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<R> {
         BinaryCopyOutStream {
-            reader,
-            types: Arc::new(types.to_vec()),
-            header: None,
+            _r: PhantomData,
+            reader: Rc::new(RefCell::new(reader)),
+            types: Rc::new(types.to_vec()),
+            header: Rc::new(RefCell::new(None)),
             future: None,
         }
     }
 }
 
-impl<'r, R> Stream for BinaryCopyOutStream<'r, R>
+impl<'f, 'r, R> Stream for BinaryCopyOutStream<'f, 'r, R>
 where
-    R: AsyncReadExt + 'r,
+    R: AsyncRead + Unpin + 'r,
 {
     type Item = Result<BinaryCopyOutRow>;
 
-    fn poll_next<'a>(self: Pin<&'a mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = &mut self.project();
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self;
 
-        if let None = *this.future {
-            *this.future = Some(self._poll_next().boxed_local());
+        if this.future.is_none() {
+            let future =
+                poll_next_row(this.reader.clone(), this.types.clone(), this.header.clone())
+                    .boxed_local();
+            this.future = Some(future);
         }
 
-        this.future.unwrap().as_mut().poll(cx)
+        match Pin::new(&mut this.future.borrow_mut().as_mut().unwrap()).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(row)) => Poll::Ready(Some(Ok(row))),
+            Poll::Ready(Err(row)) => Poll::Ready(None), // TODO
+        }
     }
 }
-
-impl<'r, R> BinaryCopyOutStream<'r, R>
+async fn poll_next_row<R>(
+    reader: Rc<RefCell<R>>,
+    types: Rc<Vec<Type>>,
+    header: Rc<RefCell<Option<Header>>>,
+) -> Result<BinaryCopyOutRow>
 where
-    R: AsyncReadExt + 'r,
+    R: AsyncRead + Unpin,
 {
-    async fn _poll_next(self: Pin<&mut Self>) -> Option<Result<BinaryCopyOutRow>> {
-        Some(self._poll_next_result().await.map_err(Error::parse))
-    }
+    _poll_next_row(reader, types, header)
+        .await
+        .map_err(Error::parse)
+}
 
-    async fn _poll_next_result(self: Pin<&mut Self>) -> io::Result<BinaryCopyOutRow> {
-        let mut this = self.project();
+async fn _poll_next_row<R>(
+    mut reader: Rc<RefCell<R>>,
+    types: Rc<Vec<Type>>,
+    header: Rc<RefCell<Option<Header>>>,
+) -> io::Result<BinaryCopyOutRow>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = reader.as_ref().borrow_mut();
 
-        let has_oids = match &this.header {
-            Some(header) => header.has_oids,
-            None => {
-                let mut magic: &mut [u8] = &mut [0; MAGIC.len()];
-                this.reader.read_exact(&mut magic).await?;
-                if magic != MAGIC {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid magic value",
-                    ));
-                }
-
-                let flags = this.reader.read_u32().await?;
-                let has_oids = (flags & (1 << 16)) != 0;
-
-                let header_extension_size = this.reader.read_u32().await?;
-                // skip header extension
-                let mut header_extension: Box<[u8]> =
-                    vec![0; header_extension_size as usize].into_boxed_slice();
-                this.reader.read_exact(&mut header_extension).await?;
-
-                *this.header = Some(Header { has_oids });
-                has_oids
-            }
-        };
-
-        let mut field_count = this.reader.read_u16().await?;
-
-        if has_oids {
-            field_count += 1;
-        }
-        if field_count as usize != this.types.len() {
+    let has_oids = if header.borrow().is_none() {
+        let mut magic: &mut [u8] = &mut [0; MAGIC.len()];
+        reader.read_exact(&mut magic).await?;
+        if magic != MAGIC {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "expected {} values but got {}",
-                    this.types.len(),
-                    field_count
-                ),
+                io::ErrorKind::InvalidData,
+                "invalid magic value",
             ));
         }
 
-        let mut buf = BytesMut::new();
-        let mut field_indices = vec![];
-        for _ in 0..field_count {
-            let field_size = this.reader.read_u32().await?;
-            let start = buf.len();
-            if field_size == u32::MAX {
-                field_indices.push(FieldIndex::Null(start));
-                continue;
-            }
-            let field_size = field_size as usize;
-            buf.resize(start + field_size, 0);
-            this.reader.read_exact(&mut buf[start..start + field_size]);
-            field_indices.push(FieldIndex::Value(start));
-        }
+        let flags = reader.borrow_mut().read_u32().await?;
+        let has_oids = (flags & (1 << 16)) != 0;
 
-        Ok(BinaryCopyOutRow {
-            fields: Fields {
-                buf,
-                indices: field_indices,
-            },
-            types: this.types.clone(),
-        })
+        let header_extension_size = reader.borrow_mut().read_u32().await?;
+        // skip header extension
+        let mut header_extension: Box<[u8]> =
+            vec![0; header_extension_size as usize].into_boxed_slice();
+        reader
+            .borrow_mut()
+            .read_exact(&mut header_extension)
+            .await?;
+
+        header.replace(Some(Header { has_oids }));
+        has_oids
+    } else {
+        header.borrow().unwrap().has_oids
+    };
+
+    let mut field_count = reader.borrow_mut().read_u16().await?;
+
+    if has_oids {
+        field_count += 1;
     }
+    if field_count as usize != types.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected {} values but got {}", types.len(), field_count),
+        ));
+    }
+
+    let mut field_buf = BytesMut::new();
+    let mut field_indices = vec![];
+    for _ in 0..field_count {
+        let field_size = reader.borrow_mut().read_u32().await?;
+        let start = field_buf.len();
+        if field_size == u32::MAX {
+            field_indices.push(FieldIndex::Null(start));
+            continue;
+        }
+        let field_size = field_size as usize;
+        field_buf.resize(start + field_size, 0);
+        reader
+            .borrow_mut()
+            .read_exact(&mut field_buf[start..start + field_size]);
+        field_indices.push(FieldIndex::Value(start));
+    }
+
+    Ok(BinaryCopyOutRow {
+        fields: Fields {
+            buf: field_buf,
+            indices: field_indices,
+        },
+        types: types.clone(),
+    })
 }
 
 enum FieldIndex {
@@ -316,7 +325,7 @@ impl Fields {
 /// A row of data parsed from a binary copy out stream.
 pub struct BinaryCopyOutRow {
     fields: Fields,
-    types: Arc<Vec<Type>>,
+    types: Rc<Vec<Type>>,
 }
 
 impl BinaryCopyOutRow {

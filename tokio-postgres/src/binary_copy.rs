@@ -244,9 +244,7 @@ where
         // skip header extension
         let mut header_extension: Box<[u8]> =
             vec![0; header_extension_size as usize].into_boxed_slice();
-        reader
-            .read_exact(&mut header_extension)
-            .await?;
+        reader.read_exact(&mut header_extension).await?;
 
         header.replace(Some(Header { has_oids }));
         has_oids
@@ -277,8 +275,7 @@ where
         }
         let field_size = field_size as usize;
         field_buf.resize(start + field_size, 0);
-        reader
-            .read_exact(&mut field_buf[start..start + field_size]);
+        reader.read_exact(&mut field_buf[start..start + field_size]);
         field_indices.push(FieldIndex::Value(start));
     }
 

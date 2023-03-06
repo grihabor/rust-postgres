@@ -237,15 +237,14 @@ where
             ));
         }
 
-        let flags = reader.borrow_mut().read_u32().await?;
+        let flags = reader.read_u32().await?;
         let has_oids = (flags & (1 << 16)) != 0;
 
-        let header_extension_size = reader.borrow_mut().read_u32().await?;
+        let header_extension_size = reader.read_u32().await?;
         // skip header extension
         let mut header_extension: Box<[u8]> =
             vec![0; header_extension_size as usize].into_boxed_slice();
         reader
-            .borrow_mut()
             .read_exact(&mut header_extension)
             .await?;
 
@@ -255,7 +254,7 @@ where
         header.borrow().unwrap().has_oids
     };
 
-    let mut field_count = reader.borrow_mut().read_u16().await?;
+    let mut field_count = reader.read_u16().await?;
 
     if has_oids {
         field_count += 1;
@@ -270,7 +269,7 @@ where
     let mut field_buf = BytesMut::new();
     let mut field_indices = vec![];
     for _ in 0..field_count {
-        let field_size = reader.borrow_mut().read_u32().await?;
+        let field_size = reader.read_u32().await?;
         let start = field_buf.len();
         if field_size == u32::MAX {
             field_indices.push(FieldIndex::Null(start));
@@ -279,7 +278,6 @@ where
         let field_size = field_size as usize;
         field_buf.resize(start + field_size, 0);
         reader
-            .borrow_mut()
             .read_exact(&mut field_buf[start..start + field_size]);
         field_indices.push(FieldIndex::Value(start));
     }

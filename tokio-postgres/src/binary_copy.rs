@@ -199,8 +199,14 @@ where
 
         match Pin::new(&mut this.future.borrow_mut().as_mut().unwrap()).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(row)) => Poll::Ready(Some(Ok(row))),
-            Poll::Ready(Err(row)) => Poll::Ready(None), // TODO
+            Poll::Ready(Ok(row)) => {
+                this.future.take();
+                Poll::Ready(Some(Ok(row)))
+            }
+            Poll::Ready(Err(row)) => {
+                this.future.take();
+                Poll::Ready(None) // TODO
+            }
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::{CopyInWriter, CopyOutReader, Error};
 use fallible_iterator::FallibleIterator;
 use futures_util::StreamExt;
 use std::pin::Pin;
+use tokio::io::AsyncRead;
 #[doc(inline)]
 pub use tokio_postgres::binary_copy::BinaryCopyOutRow;
 use tokio_postgres::binary_copy::{self, BinaryCopyOutStream};
@@ -65,33 +66,38 @@ impl<'a> BinaryCopyInWriter<'a> {
 }
 
 /// An iterator of rows deserialized from the PostgreSQL binary copy format.
-pub struct BinaryCopyOutIter<'a> {
-    connection: ConnectionRef<'a>,
-    stream: Pin<Box<BinaryCopyOutStream>>,
+pub struct BinaryCopyOutIter<'f, 'r, R>
+where
+    R: AsyncRead + Unpin + 'r,
+{
+    stream: Pin<Box<BinaryCopyOutStream<'f, 'r, R>>>,
 }
 
-impl<'a> BinaryCopyOutIter<'a> {
+impl<'f, 't, 'r, R> BinaryCopyOutIter<'f, 'r, R>
+where
+    R: AsyncRead + Unpin + 'r,
+{
     /// Creates a new iterator from a raw copy out reader and the types of the columns being returned.
-    pub fn new(reader: CopyOutReader<'a>, types: &[Type]) -> BinaryCopyOutIter<'a> {
-        let stream = reader
-            .stream
-            .into_unpinned()
-            .expect("reader has already been read from");
-
+    pub fn new(reader: R, types: &'t [Type]) -> BinaryCopyOutIter<'f, 'r, R>
+    where
+        't: 'f,
+        't: 'r,
+    {
         BinaryCopyOutIter {
-            connection: reader.connection,
-            stream: Box::pin(BinaryCopyOutStream::new(stream, types)),
+            stream: Box::pin(BinaryCopyOutStream::new(reader, types)),
         }
     }
 }
 
-impl FallibleIterator for BinaryCopyOutIter<'_> {
+impl<'f, 'r, R> FallibleIterator for BinaryCopyOutIter<'f, 'r, R>
+where
+    R: AsyncRead + Unpin + 'r,
+{
     type Item = BinaryCopyOutRow;
     type Error = Error;
 
     fn next(&mut self) -> Result<Option<BinaryCopyOutRow>, Error> {
         let stream = &mut self.stream;
-        self.connection
-            .block_on(async { stream.next().await.transpose() })
+        futures::executor::block_on(async { stream.next().await.transpose() })
     }
 }

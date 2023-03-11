@@ -10,7 +10,6 @@ use postgres_protocol::message::backend::Message;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
 
 pub async fn copy_out(client: &InnerClient, statement: Statement) -> Result<CopyOutStream, Error> {
     debug!("executing copy out statement {}", statement.name());

@@ -2,7 +2,7 @@
 
 use crate::connection::ConnectionRef;
 use crate::types::{BorrowToSql, ToSql, Type};
-use crate::{CopyInWriter, CopyOutReader, Error};
+use crate::{CopyInWriter, Error};
 use fallible_iterator::FallibleIterator;
 use futures_util::StreamExt;
 use std::pin::Pin;
@@ -68,7 +68,7 @@ impl<'a> BinaryCopyInWriter<'a> {
 /// An iterator of rows deserialized from the PostgreSQL binary copy format.
 pub struct BinaryCopyOutIter<'f, 'r, R>
 where
-    R: AsyncRead + Unpin + 'r,
+    R: AsyncRead + Unpin,
 {
     stream: Pin<Box<BinaryCopyOutStream<'f, 'r, R>>>,
 }

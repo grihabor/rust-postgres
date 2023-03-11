@@ -1,38 +1,28 @@
 //! Utilities for working with the PostgreSQL binary copy format.
 
 use core::result;
-use futures_util::future::{BoxFuture, LocalBoxFuture};
+use futures_util::future::{LocalBoxFuture};
 use std::borrow::BorrowMut;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{RefCell};
 use std::convert::TryFrom;
-use std::fmt::Binary;
 use std::future::Future;
-use std::io::Cursor;
 use std::marker::PhantomData;
-use std::mem;
-use std::ops::{Bound, Range};
-use std::os::linux::raw::pthread_t;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::slice::SliceIndex;
-use std::sync::Arc;
-use std::task::Poll::Pending;
 use std::task::{Context, Poll};
 
 use byteorder::{BigEndian, ByteOrder};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use fallible_iterator::FallibleIterator;
-use futures_util::{ready, stream_select, FutureExt, SinkExt, Stream};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures_util::{FutureExt, SinkExt, Stream};
 use pin_project::pin_project;
-use postgres_types::{BorrowToSql, Field};
+use postgres_types::{BorrowToSql};
 use tokio::io;
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::types::{FromSql, IsNull, ToSql, Type, WrongType};
-use crate::{slice_iter, CopyInSink, CopyOutStream, Error};
+use crate::{slice_iter, CopyInSink, Error};
 
 const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
-const HEADER_LEN: usize = MAGIC.len() + 4 + 4;
 
 /// A type which serializes rows into the PostgreSQL binary copy format.
 ///
@@ -126,26 +116,6 @@ impl BinaryCopyInWriter {
     }
 }
 
-pub struct StreamReader<S: Stream<Item = Bytes>> {
-    stream: S,
-}
-
-impl<S: Stream<Item = Bytes>> StreamReader<S> {
-    fn new(stream: S) -> Self {
-        StreamReader { stream }
-    }
-}
-
-impl<S: Stream<Item = Bytes>> AsyncRead for StreamReader<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        todo!()
-    }
-}
-
 #[derive(Copy, Clone)]
 struct Header {
     has_oids: bool,
@@ -153,6 +123,7 @@ struct Header {
 
 type Result<T> = result::Result<T, Error>;
 
+/// A type which deserializes rows from the PostgreSQL binary copy format.
 pub struct BinaryCopyOutStream<'f, 'r, R>
 where
     R: AsyncReadExt + Unpin + 'r,
@@ -170,7 +141,7 @@ where
     R: AsyncReadExt + Unpin + 'r,
 {
     /// Creates a stream from a raw copy out stream and the types of the columns being returned.
-    pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<R> {
+    pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<'f, 'r, R> {
         BinaryCopyOutStream {
             _r: PhantomData,
             reader: Rc::new(RefCell::new(reader)),
@@ -203,7 +174,7 @@ where
                 this.future.take();
                 Poll::Ready(Some(Ok(row)))
             }
-            Poll::Ready(Err(row)) => {
+            Poll::Ready(Err(_)) => {
                 this.future.take();
                 Poll::Ready(None) // TODO
             }
@@ -224,7 +195,7 @@ where
 }
 
 async fn _poll_next_row<R>(
-    mut reader: Rc<RefCell<R>>,
+    reader: Rc<RefCell<R>>,
     types: Rc<Vec<Type>>,
     header: Rc<RefCell<Option<Header>>>,
 ) -> io::Result<BinaryCopyOutRow>
@@ -236,6 +207,7 @@ where
     let has_oids = if header.borrow().is_none() {
         let mut magic: &mut [u8] = &mut [0; MAGIC.len()];
         reader.read_exact(&mut magic).await?;
+        println!("magic: {:?}", magic);
         if magic != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -244,13 +216,17 @@ where
         }
 
         let flags = reader.read_u32().await?;
+        println!("flags: {:?}", flags);
         let has_oids = (flags & (1 << 16)) != 0;
 
         let header_extension_size = reader.read_u32().await?;
+        println!("header extension size: {:?}", header_extension_size);
+
         // skip header extension
         let mut header_extension: Box<[u8]> =
             vec![0; header_extension_size as usize].into_boxed_slice();
         reader.read_exact(&mut header_extension).await?;
+        println!("header extension: {:?}", header_extension);
 
         header.replace(Some(Header { has_oids }));
         has_oids
@@ -259,6 +235,7 @@ where
     };
 
     let mut field_count = reader.read_u16().await?;
+    println!("field count: {:?}", field_count);
 
     if has_oids {
         field_count += 1;
@@ -274,6 +251,8 @@ where
     let mut field_indices = vec![];
     for _ in 0..field_count {
         let field_size = reader.read_u32().await?;
+        println!("field size: {:?}", field_size);
+
         let start = field_buf.len();
         if field_size == u32::MAX {
             field_indices.push(FieldIndex::Null(start));
@@ -281,7 +260,8 @@ where
         }
         let field_size = field_size as usize;
         field_buf.resize(start + field_size, 0);
-        reader.read_exact(&mut field_buf[start..start + field_size]);
+        reader.read_exact(&mut field_buf[start..start + field_size]).await?;
+        println!("buf: {:?}", field_buf);
         field_indices.push(FieldIndex::Value(start));
     }
 
@@ -294,6 +274,7 @@ where
     })
 }
 
+#[derive(Debug)]
 enum FieldIndex {
     Value(usize),
     Null(usize),
@@ -308,6 +289,7 @@ impl FieldIndex {
     }
 }
 
+#[derive(Debug)]
 struct Fields {
     buf: BytesMut,
     indices: Vec<FieldIndex>,
@@ -324,6 +306,7 @@ impl Fields {
 }
 
 /// A row of data parsed from a binary copy out stream.
+#[derive(Debug)]
 pub struct BinaryCopyOutRow {
     fields: Fields,
     types: Rc<Vec<Type>>,

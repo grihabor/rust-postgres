@@ -1,9 +1,9 @@
 //! Utilities for working with the PostgreSQL binary copy format.
 
 use core::result;
-use futures_util::future::{LocalBoxFuture};
+use futures_util::future::LocalBoxFuture;
 use std::borrow::BorrowMut;
-use std::cell::{RefCell};
+use std::cell::RefCell;
 use std::convert::TryFrom;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -15,7 +15,7 @@ use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{FutureExt, SinkExt, Stream};
 use pin_project::pin_project;
-use postgres_types::{BorrowToSql};
+use postgres_types::BorrowToSql;
 use tokio::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -260,7 +260,9 @@ where
         }
         let field_size = field_size as usize;
         field_buf.resize(start + field_size, 0);
-        reader.read_exact(&mut field_buf[start..start + field_size]).await?;
+        reader
+            .read_exact(&mut field_buf[start..start + field_size])
+            .await?;
         println!("buf: {:?}", field_buf);
         field_indices.push(FieldIndex::Value(start));
     }

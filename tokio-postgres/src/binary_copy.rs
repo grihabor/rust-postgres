@@ -65,10 +65,10 @@ impl BinaryCopyInWriter {
     ///
     /// Panics if the number of values provided does not match the number expected.
     pub async fn write_raw<P, I>(self: Pin<&mut Self>, values: I) -> Result<()>
-    where
-        P: BorrowToSql,
-        I: IntoIterator<Item = P>,
-        I::IntoIter: ExactSizeIterator,
+        where
+            P: BorrowToSql,
+            I: IntoIterator<Item=P>,
+            I::IntoIter: ExactSizeIterator,
     {
         let mut this = self.project();
 
@@ -125,20 +125,20 @@ type Result<T> = result::Result<T, Error>;
 
 /// A type which deserializes rows from the PostgreSQL binary copy format.
 pub struct BinaryCopyOutStream<'f, 'r, R>
-where
-    R: AsyncReadExt + Unpin + 'r,
-    'r: 'f,
+    where
+        R: AsyncReadExt + Unpin + 'r,
+        'r: 'f,
 {
     _r: PhantomData<&'r ()>,
     reader: Rc<RefCell<R>>,
     types: Rc<Vec<Type>>,
     header: Rc<RefCell<Option<Header>>>,
-    future: Option<LocalBoxFuture<'f, Result<BinaryCopyOutRow>>>,
+    future: Option<LocalBoxFuture<'f, Option<Result<BinaryCopyOutRow>>>>,
 }
 
 impl<'f, 'r, R> BinaryCopyOutStream<'f, 'r, R>
-where
-    R: AsyncReadExt + Unpin + 'r,
+    where
+        R: AsyncReadExt + Unpin + 'r,
 {
     /// Creates a stream from a raw copy out stream and the types of the columns being returned.
     pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<'f, 'r, R> {
@@ -153,8 +153,8 @@ where
 }
 
 impl<'f, 'r, R> Stream for BinaryCopyOutStream<'f, 'r, R>
-where
-    R: AsyncRead + Unpin + 'r,
+    where
+        R: AsyncRead + Unpin + 'r,
 {
     type Item = Result<BinaryCopyOutRow>;
 
@@ -170,62 +170,60 @@ where
 
         match Pin::new(&mut this.future.borrow_mut().as_mut().unwrap()).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(row)) => {
+            Poll::Ready(option) => {
                 this.future.take();
-                Poll::Ready(Some(Ok(row)))
-            }
-            Poll::Ready(Err(_)) => {
-                this.future.take();
-                Poll::Ready(None) // TODO
+                Poll::Ready(option)
             }
         }
     }
 }
+
 async fn poll_next_row<R>(
     reader: Rc<RefCell<R>>,
     types: Rc<Vec<Type>>,
     header: Rc<RefCell<Option<Header>>>,
-) -> Result<BinaryCopyOutRow>
-where
-    R: AsyncRead + Unpin,
+) -> Option<Result<BinaryCopyOutRow>>
+    where
+        R: AsyncRead + Unpin,
 {
     _poll_next_row(reader, types, header)
         .await
-        .map_err(Error::parse)
+        .map(|r| r.map_err(Error::parse))
 }
+
 
 async fn _poll_next_row<R>(
     reader: Rc<RefCell<R>>,
     types: Rc<Vec<Type>>,
     header: Rc<RefCell<Option<Header>>>,
-) -> io::Result<BinaryCopyOutRow>
-where
-    R: AsyncRead + Unpin,
+) -> Option<io::Result<BinaryCopyOutRow>>
+    where
+        R: AsyncRead + Unpin,
 {
     let mut reader = reader.as_ref().borrow_mut();
 
     let has_oids = if header.borrow().is_none() {
         let mut magic: &mut [u8] = &mut [0; MAGIC.len()];
-        reader.read_exact(&mut magic).await?;
+        Some(reader.read_exact(&mut magic).await)?.unwrap();
         println!("magic: {:?}", magic);
         if magic != MAGIC {
-            return Err(io::Error::new(
+            return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid magic value",
-            ));
+            )));
         }
 
-        let flags = reader.read_u32().await?;
+        let flags = Some(reader.read_u32().await)?.unwrap();
         println!("flags: {:?}", flags);
         let has_oids = (flags & (1 << 16)) != 0;
 
-        let header_extension_size = reader.read_u32().await?;
+        let header_extension_size = Some(reader.read_u32().await)?.unwrap();
         println!("header extension size: {:?}", header_extension_size);
 
         // skip header extension
         let mut header_extension: Box<[u8]> =
             vec![0; header_extension_size as usize].into_boxed_slice();
-        reader.read_exact(&mut header_extension).await?;
+        Some(reader.read_exact(&mut header_extension).await)?.unwrap();
         println!("header extension: {:?}", header_extension);
 
         header.replace(Some(Header { has_oids }));
@@ -234,23 +232,27 @@ where
         header.borrow().unwrap().has_oids
     };
 
-    let mut field_count = reader.read_u16().await?;
+    let mut field_count = match reader.read_u16().await {
+        Ok(field_count) => field_count,
+        Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+        Err(err) => return Some(Err(err))
+    };
     println!("field count: {:?}", field_count);
 
     if has_oids {
         field_count += 1;
     }
     if field_count as usize != types.len() {
-        return Err(io::Error::new(
+        return Some(Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("expected {} values but got {}", types.len(), field_count),
-        ));
+        )));
     }
 
     let mut field_buf = BytesMut::new();
     let mut field_indices = vec![];
     for _ in 0..field_count {
-        let field_size = reader.read_u32().await?;
+        let field_size = Some(reader.read_u32().await)?.unwrap();
         println!("field size: {:?}", field_size);
 
         let start = field_buf.len();
@@ -260,20 +262,20 @@ where
         }
         let field_size = field_size as usize;
         field_buf.resize(start + field_size, 0);
-        reader
+        Some(reader
             .read_exact(&mut field_buf[start..start + field_size])
-            .await?;
+            .await)?.unwrap();
         println!("buf: {:?}", field_buf);
         field_indices.push(FieldIndex::Value(start));
     }
 
-    Ok(BinaryCopyOutRow {
+    Some(Ok(BinaryCopyOutRow {
         fields: Fields {
             buf: field_buf,
             indices: field_indices,
         },
         types: types.clone(),
-    })
+    }))
 }
 
 #[derive(Debug)]
@@ -317,8 +319,8 @@ pub struct BinaryCopyOutRow {
 impl BinaryCopyOutRow {
     /// Like `get`, but returns a `Result` rather than panicking.
     pub fn try_get<'a, T>(&'a self, idx: usize) -> Result<T>
-    where
-        T: FromSql<'a>,
+        where
+            T: FromSql<'a>,
     {
         let type_ = match self.types.get(idx) {
             Some(type_) => type_,
@@ -346,8 +348,8 @@ impl BinaryCopyOutRow {
     ///
     /// Panics if the index is out of bounds or if the value cannot be converted to the specified type.
     pub fn get<'a, T>(&'a self, idx: usize) -> T
-    where
-        T: FromSql<'a>,
+        where
+            T: FromSql<'a>,
     {
         match self.try_get(idx) {
             Ok(value) => value,

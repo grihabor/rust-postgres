@@ -65,10 +65,10 @@ impl BinaryCopyInWriter {
     ///
     /// Panics if the number of values provided does not match the number expected.
     pub async fn write_raw<P, I>(self: Pin<&mut Self>, values: I) -> Result<()>
-        where
-            P: BorrowToSql,
-            I: IntoIterator<Item=P>,
-            I::IntoIter: ExactSizeIterator,
+    where
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
     {
         let mut this = self.project();
 
@@ -125,9 +125,9 @@ type Result<T> = result::Result<T, Error>;
 
 /// A type which deserializes rows from the PostgreSQL binary copy format.
 pub struct BinaryCopyOutStream<'f, 'r, R>
-    where
-        R: AsyncReadExt + Unpin + 'r,
-        'r: 'f,
+where
+    R: AsyncReadExt + Unpin + 'r,
+    'r: 'f,
 {
     _r: PhantomData<&'r ()>,
     reader: Rc<RefCell<R>>,
@@ -137,8 +137,8 @@ pub struct BinaryCopyOutStream<'f, 'r, R>
 }
 
 impl<'f, 'r, R> BinaryCopyOutStream<'f, 'r, R>
-    where
-        R: AsyncReadExt + Unpin + 'r,
+where
+    R: AsyncReadExt + Unpin + 'r,
 {
     /// Creates a stream from a raw copy out stream and the types of the columns being returned.
     pub fn new(reader: R, types: &[Type]) -> BinaryCopyOutStream<'f, 'r, R> {
@@ -153,8 +153,8 @@ impl<'f, 'r, R> BinaryCopyOutStream<'f, 'r, R>
 }
 
 impl<'f, 'r, R> Stream for BinaryCopyOutStream<'f, 'r, R>
-    where
-        R: AsyncRead + Unpin + 'r,
+where
+    R: AsyncRead + Unpin + 'r,
 {
     type Item = Result<BinaryCopyOutRow>;
 
@@ -183,28 +183,36 @@ async fn poll_next_row<R>(
     types: Rc<Vec<Type>>,
     header: Rc<RefCell<Option<Header>>>,
 ) -> Option<Result<BinaryCopyOutRow>>
-    where
-        R: AsyncRead + Unpin,
+where
+    R: AsyncRead + Unpin,
 {
     _poll_next_row(reader, types, header)
         .await
         .map(|r| r.map_err(Error::parse))
 }
 
+macro_rules! try_ {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        }
+    };
+}
 
 async fn _poll_next_row<R>(
     reader: Rc<RefCell<R>>,
     types: Rc<Vec<Type>>,
     header: Rc<RefCell<Option<Header>>>,
 ) -> Option<io::Result<BinaryCopyOutRow>>
-    where
-        R: AsyncRead + Unpin,
+where
+    R: AsyncRead + Unpin,
 {
     let mut reader = reader.as_ref().borrow_mut();
 
     let has_oids = if header.borrow().is_none() {
         let mut magic: &mut [u8] = &mut [0; MAGIC.len()];
-        Some(reader.read_exact(&mut magic).await)?.unwrap();
+        try_!(reader.read_exact(&mut magic).await);
         println!("magic: {:?}", magic);
         if magic != MAGIC {
             return Some(Err(io::Error::new(
@@ -213,17 +221,17 @@ async fn _poll_next_row<R>(
             )));
         }
 
-        let flags = Some(reader.read_u32().await)?.unwrap();
+        let flags = try_!(reader.read_u32().await);
         println!("flags: {:?}", flags);
         let has_oids = (flags & (1 << 16)) != 0;
 
-        let header_extension_size = Some(reader.read_u32().await)?.unwrap();
+        let header_extension_size = try_!(reader.read_u32().await);
         println!("header extension size: {:?}", header_extension_size);
 
         // skip header extension
         let mut header_extension: Box<[u8]> =
             vec![0; header_extension_size as usize].into_boxed_slice();
-        Some(reader.read_exact(&mut header_extension).await)?.unwrap();
+        try_!(reader.read_exact(&mut header_extension).await);
         println!("header extension: {:?}", header_extension);
 
         header.replace(Some(Header { has_oids }));
@@ -232,11 +240,11 @@ async fn _poll_next_row<R>(
         header.borrow().unwrap().has_oids
     };
 
-    let mut field_count = match reader.read_u16().await {
-        Ok(field_count) => field_count,
-        Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
-        Err(err) => return Some(Err(err))
-    };
+    let mut field_count = try_!(reader.read_u16().await);
+    if field_count == u16::MAX {
+        // end of binary stream
+        return None;
+    }
     println!("field count: {:?}", field_count);
 
     if has_oids {
@@ -252,7 +260,7 @@ async fn _poll_next_row<R>(
     let mut field_buf = BytesMut::new();
     let mut field_indices = vec![];
     for _ in 0..field_count {
-        let field_size = Some(reader.read_u32().await)?.unwrap();
+        let field_size = try_!(reader.read_u32().await);
         println!("field size: {:?}", field_size);
 
         let start = field_buf.len();
@@ -262,9 +270,11 @@ async fn _poll_next_row<R>(
         }
         let field_size = field_size as usize;
         field_buf.resize(start + field_size, 0);
-        Some(reader
-            .read_exact(&mut field_buf[start..start + field_size])
-            .await)?.unwrap();
+        try_!(
+            reader
+                .read_exact(&mut field_buf[start..start + field_size])
+                .await
+        );
         println!("buf: {:?}", field_buf);
         field_indices.push(FieldIndex::Value(start));
     }
@@ -319,8 +329,8 @@ pub struct BinaryCopyOutRow {
 impl BinaryCopyOutRow {
     /// Like `get`, but returns a `Result` rather than panicking.
     pub fn try_get<'a, T>(&'a self, idx: usize) -> Result<T>
-        where
-            T: FromSql<'a>,
+    where
+        T: FromSql<'a>,
     {
         let type_ = match self.types.get(idx) {
             Some(type_) => type_,
@@ -348,8 +358,8 @@ impl BinaryCopyOutRow {
     ///
     /// Panics if the index is out of bounds or if the value cannot be converted to the specified type.
     pub fn get<'a, T>(&'a self, idx: usize) -> T
-        where
-            T: FromSql<'a>,
+    where
+        T: FromSql<'a>,
     {
         match self.try_get(idx) {
             Ok(value) => value,
